@@ -9,6 +9,8 @@
 #define OUT_TILE_DIM 32
 #define TILE_DIM 32
 
+#define IN_TILE_DIM2 32
+#define OUT_TILE_DIM2 ((IN_TILE_DIM2) - 2*(FILTER_RADIUS))
 
 using json = nlohmann::json;
 using namespace std;
@@ -50,6 +52,38 @@ void conv_cached_tiled_2d_constant_mem_kernel(float *N, float *P,
 
     }
 
+}
+
+__global__
+void conv_tiled_2d_in_constant_mem_kernel(float *N, float *P,
+                    int width, int height){
+    int row = blockIdx.y * OUT_TILE_DIM2 + threadIdx.y - FILTER_RADIUS;
+    int col = blockIdx.x * OUT_TILE_DIM2 + threadIdx.x - FILTER_RADIUS;  
+
+    __shared__ float N_s[IN_TILE_DIM2][IN_TILE_DIM2];
+
+    if(row >= 0 && row < height && col >= 0 && col < width){
+        N_s[threadIdx.y][threadIdx.x] = N[row * width + col];
+    }else{
+        N_s[threadIdx.y][threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    int tileCol = threadIdx.x - FILTER_RADIUS;
+    int tileRow = threadIdx.y - FILTER_RADIUS;
+
+    if(col >= 0 && col < width && row >= 0 && row < height){
+        if(tileCol >= 0 && tileCol < OUT_TILE_DIM2 &&
+           tileRow >= 0 && tileRow < OUT_TILE_DIM2){
+            float Pvalue = 0.0f;
+            for(int fRow = 0; fRow < FILTER_SIZE; fRow++){
+                for(int fCol = 0; fCol < FILTER_SIZE; fCol++){
+                    Pvalue += F[fRow][fCol] * N_s[tileRow + fRow][tileCol + fCol];
+                }
+            }
+            P[row * width + col] = Pvalue;
+        }
+    }
 }
 
 __global__ 
@@ -268,6 +302,26 @@ int main(int argc, char* argv[])
             idx++;
         }
     } 
+
+    dim3 blockDim4(IN_TILE_DIM2, IN_TILE_DIM2);
+    dim3 gridDim4(ceil((float)width / OUT_TILE_DIM2), ceil((float)height / OUT_TILE_DIM2));
+
+    conv_tiled_2d_in_constant_mem_kernel<<<gridDim4, blockDim4>>>(deviceImg, deviceResult, width, height);
+
+    cudaMemcpy(hostResult, deviceResult, height * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cout << "check conv_tiled_2d_in_constant_mem_kernel" << endl;
+    //check
+    idx = 0;
+    for(auto row : output){
+        for(auto col: row){
+            if(abs(col - hostResult[idx]) > 1e-6){
+                cout << idx << " bad: " << col << " - " << hostResult[idx] << " > 1e-6" << endl;
+                break;
+            }
+            idx++;
+        }
+    }
 
     dim3 blockDim3(TILE_DIM, TILE_DIM);
     dim3 gridDim3(ceil((float)width / blockDim.x), ceil((float)height / blockDim.y));
